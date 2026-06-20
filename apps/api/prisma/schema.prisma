@@ -1,0 +1,370 @@
+// TataCLiQ Seller Dashboard — Prisma Schema
+// Covers Phases 1-4. Run with:  npx prisma migrate dev --name init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =====================================================================
+// Users (internal operations team)
+// =====================================================================
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  name          String
+  role          UserRole @default(OPS)
+  avatarUrl     String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  assignedEmails Email[] @relation("AssignedTo")
+}
+
+enum UserRole {
+  OPS
+  ADMIN
+  VIEWER
+}
+
+// =====================================================================
+// Sellers
+// =====================================================================
+model Seller {
+  id            String   @id @default(cuid())
+  name          String
+  email         String   @unique
+  brandName     String?
+  qualityScore  Float    @default(0)   // 0..1
+  totalProducts Int      @default(0)
+  totalEmails   Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  emails   Email[]
+  products Product[]
+
+  @@index([email])
+}
+
+// =====================================================================
+// Emails (Gmail ingestion)
+// =====================================================================
+model Email {
+  id              String      @id @default(cuid())
+  gmailMessageId  String      @unique
+  threadId        String?
+  sellerId        String
+  seller          Seller      @relation(fields: [sellerId], references: [id])
+
+  fromAddress     String
+  subject         String
+  bodyText        String?     @db.Text
+  bodyHtml        String?     @db.Text
+  receivedAt      DateTime
+  status          EmailStatus @default(PENDING)
+  confidenceScore Float?      // 0..100, set after AI parsing
+  missingFields   String[]    @default([])
+
+  assignedToId    String?
+  assignedTo      User?       @relation("AssignedTo", fields: [assignedToId], references: [id])
+
+  attachments  Attachment[]
+  products     Product[]
+  queueJobs    QueueJob[]
+  communications Communication[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([sellerId])
+  @@index([status])
+  @@index([receivedAt])
+}
+
+enum EmailStatus {
+  PENDING
+  PARSING
+  PARSED
+  ENRICHING
+  ENRICHED
+  VALIDATED
+  AWAITING_SELLER
+  FAILED
+}
+
+// =====================================================================
+// Attachments (Excel / images / zips stored in S3)
+// =====================================================================
+model Attachment {
+  id          String          @id @default(cuid())
+  emailId     String
+  email       Email           @relation(fields: [emailId], references: [id], onDelete: Cascade)
+  filename    String
+  mimeType    String
+  size        Int
+  storageKey  String          // S3 key
+  storageUrl  String?
+  type        AttachmentType
+  parsedAt    DateTime?
+
+  createdAt   DateTime @default(now())
+
+  @@index([emailId])
+}
+
+enum AttachmentType {
+  EXCEL
+  CSV
+  ZIP
+  IMAGE
+  PDF
+  OTHER
+}
+
+// =====================================================================
+// Products (rows extracted from seller sheets)
+// =====================================================================
+model Product {
+  id            String   @id @default(cuid())
+  emailId       String
+  email         Email    @relation(fields: [emailId], references: [id], onDelete: Cascade)
+  sellerId      String
+  seller        Seller   @relation(fields: [sellerId], references: [id])
+
+  sku           String?
+  ean           String?
+  title         String?
+  brand         String?
+  category      String?
+  mrp           Float?
+  imageUrls     String[] @default([])
+
+  // Enrichment state
+  status            ProductStatus @default(PENDING)
+  confidenceScore   Float?
+  enrichedAt        DateTime?
+
+  attributes     ProductAttribute[]
+  aiSuggestions  AISuggestion[]
+  validationIssues ValidationIssue[]
+  images         ProductImage[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([emailId])
+  @@index([sellerId])
+  @@index([sku])
+}
+
+enum ProductStatus {
+  PENDING
+  ENRICHING
+  ENRICHED
+  VALIDATED
+  REJECTED
+}
+
+// Flexible attribute storage (HSN, fabric, sleeve_type, neckline, etc.)
+model ProductAttribute {
+  id        String  @id @default(cuid())
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  key       String  // e.g. "hsn_code", "fabric_family", "sleeve_type"
+  value     String
+  source    AttributeSource @default(SELLER)
+  confidence Float?
+
+  @@unique([productId, key])
+  @@index([productId])
+}
+
+enum AttributeSource {
+  SELLER          // came from seller's sheet
+  GEMINI_TEXT     // Gemini text inference
+  GEMINI_VISION   // Gemini vision model
+  CROSS_REF       // Cross-referenced from Myntra / Ajio / Amazon Fashion
+  MANUAL          // Ops member entered manually
+}
+
+// =====================================================================
+// AI Suggestions (Gemini outputs awaiting ops review)
+// =====================================================================
+model AISuggestion {
+  id           String  @id @default(cuid())
+  productId    String
+  product      Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  fieldKey     String
+  suggestedValue String
+  reasoning    String? @db.Text
+  source       AttributeSource
+  confidence   Float
+  status       SuggestionStatus @default(PENDING)
+  reviewedById String?
+  reviewedAt   DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([productId])
+  @@index([status])
+}
+
+enum SuggestionStatus {
+  PENDING
+  ACCEPTED
+  EDITED
+  REJECTED
+}
+
+// =====================================================================
+// Validation Issues
+// =====================================================================
+model ValidationIssue {
+  id        String   @id @default(cuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  field     String
+  severity  Severity
+  message   String
+  aiFix     String?
+  resolved  Boolean  @default(false)
+  resolvedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([productId])
+  @@index([severity])
+  @@index([resolved])
+}
+
+enum Severity {
+  ERROR
+  WARNING
+  INFO
+}
+
+// =====================================================================
+// Images (originals + AI-enhanced 1080x1440 outpaints)
+// =====================================================================
+model ProductImage {
+  id              String   @id @default(cuid())
+  productId       String
+  product         Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  originalUrl     String
+  enhancedUrl     String?
+  width           Int?
+  height          Int?
+  outpaintMode    String?  // "fashion_aware" | "balanced" | "background_only"
+  personDetected  Boolean  @default(false)
+  garmentIntegrity Float?  // 0..1
+  status          ImageStatus @default(PENDING)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([productId])
+}
+
+enum ImageStatus {
+  PENDING
+  PROCESSING
+  ENHANCED
+  APPROVED
+  REJECTED
+}
+
+// =====================================================================
+// Queue jobs (BullMQ mirror table for the UI)
+// =====================================================================
+model QueueJob {
+  id          String   @id @default(cuid())
+  bullJobId   String?
+  emailId     String?
+  email       Email?   @relation(fields: [emailId], references: [id], onDelete: SetNull)
+  type        JobType
+  status      JobStatus @default(QUEUED)
+  worker      String?
+  progress    Int      @default(0)
+  attempts    Int      @default(0)
+  lastError   String?
+  payload     Json?
+  startedAt   DateTime?
+  finishedAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([type])
+}
+
+enum JobType {
+  GMAIL_FETCH
+  EXCEL_PARSE
+  GEMINI_ENRICH
+  IMAGE_OUTPAINT
+  VALIDATE
+  SHEET_GENERATE
+  SELLER_NOTIFY
+}
+
+enum JobStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+  RETRYING
+}
+
+// =====================================================================
+// Master Sheets (final portal-ready outputs)
+// =====================================================================
+model MasterSheet {
+  id            String   @id @default(cuid())
+  name          String
+  sellerId      String?
+  productCount  Int
+  status        SheetStatus @default(READY)
+  storageKey    String
+  downloadUrl   String?
+  submittedAt   DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([status])
+}
+
+enum SheetStatus {
+  READY
+  SUBMITTED
+  PENDING_VALIDATION
+  REJECTED
+}
+
+// =====================================================================
+// Seller Communications
+// =====================================================================
+model Communication {
+  id        String   @id @default(cuid())
+  emailId   String
+  email     Email    @relation(fields: [emailId], references: [id], onDelete: Cascade)
+  direction Direction
+  subject   String?
+  body      String   @db.Text
+  aiDrafted Boolean  @default(false)
+  sentAt    DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([emailId])
+}
+
+enum Direction {
+  INBOUND
+  OUTBOUND
+}
