@@ -1,0 +1,6 @@
+{
+  "name": "@tatacliq/ui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shared UI primitives. Phase 1 keeps components inside apps/web; this package will be extracted in Phase 2+."
+}
